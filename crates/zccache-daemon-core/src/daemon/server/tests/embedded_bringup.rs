@@ -173,6 +173,18 @@ async fn early_flush_keeps_the_graph_the_load_is_restoring() {
     let report = second.flush().await;
     releaser.await.unwrap();
     assert!(report.is_complete(), "{report:?}");
+    let steps: Vec<_> = report.steps.iter().map(|step| step.step.as_str()).collect();
+    assert_eq!(
+        steps,
+        [
+            "artifact_store",
+            "metadata",
+            "compiler_hash",
+            "system_includes",
+            "depgraph",
+        ],
+        "independent snapshots must save before the startup depgraph wait"
+    );
     assert_eq!(second.state.dep_graph.load().stats().context_count, 1);
     second.shutdown().await;
 

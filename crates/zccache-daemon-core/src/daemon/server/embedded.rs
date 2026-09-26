@@ -716,33 +716,6 @@ async fn flush_embedded_state(
         .await,
     );
 
-    let depgraph_path = embedded_depgraph_file_path(state);
-    let depgraph_state = Arc::clone(state);
-    steps.push(
-        flush_step("depgraph", async move {
-            if !super::embedded_bringup::await_depgraph_load(&depgraph_state).await {
-                tracing::warn!(
-                    "startup depgraph load still pending; flush keeps the on-disk graph"
-                );
-                return Ok(());
-            }
-            run_depgraph_save_with(Arc::clone(&depgraph_state), runtime_handle, move |dg| {
-                if let Some(parent) = depgraph_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                }
-                crate::depgraph::save_to_file(dg, depgraph_path.as_path())
-                    .map_err(|error| error.to_string())?;
-                depgraph_state
-                    .dep_graph_persisted
-                    .store(true, Ordering::Release);
-                Ok::<(), String>(())
-            })
-            .await
-            .map_err(|error| format!("depgraph save task failed: {error}"))?
-        })
-        .await,
-    );
-
     let metadata_entries = state.cache_system.metadata().len() as u64;
     if state.metadata_cache_loaded.load(Ordering::Acquire) {
         let metadata_state = Arc::clone(state);
@@ -800,6 +773,36 @@ async fn flush_embedded_state(
             .await,
         );
     }
+
+    // These snapshots are independent of the depgraph load. Persist them
+    // before the potentially long startup-load wait so a short host exit
+    // budget can keep their latest state even when the graph is still loading.
+    let depgraph_path = embedded_depgraph_file_path(state);
+    let depgraph_state = Arc::clone(state);
+    steps.push(
+        flush_step("depgraph", async move {
+            if !super::embedded_bringup::await_depgraph_load(&depgraph_state).await {
+                tracing::warn!(
+                    "startup depgraph load still pending; flush keeps the on-disk graph"
+                );
+                return Ok(());
+            }
+            run_depgraph_save_with(Arc::clone(&depgraph_state), runtime_handle, move |dg| {
+                if let Some(parent) = depgraph_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                crate::depgraph::save_to_file(dg, depgraph_path.as_path())
+                    .map_err(|error| error.to_string())?;
+                depgraph_state
+                    .dep_graph_persisted
+                    .store(true, Ordering::Release);
+                Ok::<(), String>(())
+            })
+            .await
+            .map_err(|error| format!("depgraph save task failed: {error}"))?
+        })
+        .await,
+    );
 
     EmbeddedFlushReport {
         pending_writes_drained,

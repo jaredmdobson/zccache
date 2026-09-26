@@ -46,6 +46,7 @@ failed cache-root audit retain its diagnostic JSONL evidence.
 - **Shared embedded host-work admission** → [embedded-service.md § Shared host-work admission](architecture/embedded-service.md#shared-host-work-admission)
 - **Embedded heap snapshots** → [embedded-service.md § Heap snapshots](architecture/embedded-service.md#heap-snapshots)
 - **Embedded maintenance limits and shutdown reporting** → [embedded-service.md § Maintenance limits and task ownership](architecture/embedded-service.md#maintenance-limits-and-task-ownership)
+- **Embedded snapshots and interrupted flushes** → [embedded-service.md § Persisted state and interrupted flushes](architecture/embedded-service.md#persisted-state-and-interrupted-flushes-1719)
 - **Embedded host compiler-admission policy and cache-hit bypass** → [embedded-service.md § Host compiler-admission policy](architecture/embedded-service.md#host-compiler-admission-policy)
 - **Shared periodic maintenance schedule (both service modes)** → [embedded-service.md § Maintenance limits and task ownership](architecture/embedded-service.md#maintenance-limits-and-task-ownership)
 - **Legacy action target snapshots** → [target-cache.md](architecture/target-cache.md)

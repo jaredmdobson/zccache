@@ -1,3 +1,11 @@
+# #1719 embedded flush consistency
+
+- [x] Inventory startup loads, flush/shutdown/periodic writers, the in-memory WAL, and per-file durability guarantees.
+- [x] Test that a newer artifact index with older auxiliary snapshots restarts and serves the current source contents.
+- [x] Move independent snapshots before the pending depgraph load wait and verify flush step order.
+- [x] Document interruption outcomes and the remaining deadline-aware flush recommendation.
+- [x] Run focused tests, formatting, workspace lint, and local review.
+
 # #1613 source-tree PCH fixture compile phase
 
 - [x] Reproduce both original #1609 PCH fixtures independently and capture their compiler/daemon evidence.

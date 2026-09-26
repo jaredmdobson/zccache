@@ -508,6 +508,60 @@ than overwriting the on-disk graph with the empty default; shutdown joins it.
 contexts, or the save interval), not only by flush/shutdown/drop, so a host
 that exits without shutting the service down still restarts warm.
 
+### Persisted state and interrupted flushes (#1719)
+
+The paths below are relative to `daemon-state/<identity>/` under the cache
+root. Embedded startup loads the index, metadata, compiler hash, and system
+include snapshots before readiness; the depgraph loads afterward. The index
+writer's “WAL” is an **in-memory** batch of index updates, not a separate
+on-disk log. Its timer, size threshold, explicit flush, and shutdown all
+checkpoint the whole index into `index.bin`.
+
+| Path | Writers | Disk format and write guarantee |
+|---|---|---|
+| `index.bin` | Index-writer checkpoints, embedded flush/shutdown, best-effort drop checkpoint | Unversioned bincode rows; temp file, file fsync, rename, best-effort parent fsync. The writer serializes its own flushes. |
+| `artifacts/` | Compile publication and disk maintenance | Payload files or staged/packed artifact layouts; publication precedes index insertion. Individual artifacts have their own commit protocol, not a cross-snapshot transaction. |
+| `depgraph/depgraph.bin` | Periodic depgraph save, embedded flush/shutdown, best-effort drop checkpoint | `ZCDG` header, version 8; temp file and file fsync. The saver currently removes the old destination before rename, leaving a small interruption window in which the file can be absent. Depgraph load/save operations share a persistence lock. |
+| `metadata.bin` | Periodic metadata snapshot, embedded flush/shutdown, best-effort drop checkpoint | Version 1 bincode; unique temp name per write, file fsync, rename, best-effort parent fsync. Empty snapshots do not overwrite the old file. |
+| `compiler_hash.bin` | Embedded flush/shutdown | Version 2 bincode; temp file, file fsync, rename, best-effort parent fsync. |
+| `system_includes.bin` | Embedded flush/shutdown | Version 1 bincode; temp file, file fsync, rename, best-effort parent fsync. |
+
+These files have no shared generation marker and are not committed as one
+transaction. Depgraph contexts can contain artifact keys; the index maps keys
+to payload names. A newer index with an older graph can make new artifacts
+unreachable until recomputed. An older index with a newer graph can leave a
+graph key with no artifact row, which must miss. Restored metadata hashes and
+compiler hashes are checked against source/compiler `(mtime, size)` before use;
+restored system include paths are checked against the compiler's same fields.
+Unreadable snapshots load as empty state with a warning, so a damaged file
+should cost warmth rather than prevent startup.
+
+An interruption while draining writes can leave published payloads whose index
+rows were not checkpointed; those payloads are not reachable as hits. Once the
+index checkpoint lands, any later interruption can leave it newer than one or
+more auxiliary snapshots. A missing payload or index row must miss rather than
+serve an incomplete artifact. Killing a snapshot writer before its rename
+normally leaves the previous file in place; the depgraph's remove-before-rename
+window is the exception and can leave that snapshot absent. A periodic metadata
+save can overlap a host flush: each write has its own temp name, but the last
+rename wins, so it can leave an older, still stat-validated metadata snapshot.
+There is no cross-file rollback on any of these paths.
+
+Flush first drains pending writes and waits for the publication barrier, then
+checkpoints the index and artifacts. It saves metadata, compiler hashes, and
+system includes before waiting up to 60 s for the startup depgraph load. This
+order gives the independent snapshots a chance to complete within a short host
+exit budget. The depgraph load gate remains necessary: saving its empty default
+while the real snapshot is still loading would discard useful state. A future
+deadline-aware flush should report completed and skipped steps explicitly; a
+caller-side timeout cannot tell which writes finished, and dropping a flush
+future does not cancel its blocking file writes. Skipping the depgraph save
+when its startup load is pending would avoid the 60 s wait and preserve the
+previous graph, at the cost of losing any graph updates from this short-lived
+process. That is preferable to overwriting the graph with the empty default,
+but should be a deliberate deadline-aware result rather than a reported
+"completed" step.
+
 Cancellation must be cooperative and observable. A cancelled build should
 produce a terminal audit event with enough detail to distinguish:
 
