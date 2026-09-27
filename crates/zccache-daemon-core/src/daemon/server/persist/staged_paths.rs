@@ -191,6 +191,81 @@ pub(in crate::daemon::server) fn rehydrate_logical_depfile(
     Ok(())
 }
 
+/// Rebase the physical include path and env-dep in a cached rustc dep-info
+/// file after a certified path-only `OUT_DIR` hit (#1749). Cargo must see the
+/// *current* build-script output directory even though the compiled artifact
+/// is shared with another worktree.
+pub(in crate::daemon::server) fn rehydrate_rustc_out_dir_depfile(
+    path: &Path,
+    current_out_dir: &Path,
+    generated_name: &str,
+) -> io::Result<()> {
+    const PREFIX: &[u8] = b"# env-dep:OUT_DIR=";
+    let bytes = std::fs::read(path)?;
+    let mut old_out_dir = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if let Some(value) = line.strip_prefix(PREFIX) {
+            if old_out_dir.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rustc dep-info has duplicate OUT_DIR env dependencies",
+                ));
+            }
+            old_out_dir = Some(value.strip_suffix(b"\r").unwrap_or(value));
+        }
+    }
+    let old_out_dir = old_out_dir.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rustc dep-info lacks an OUT_DIR env dependency",
+        )
+    })?;
+    let old_out_dir = std::str::from_utf8(old_out_dir)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !Path::new(old_out_dir).is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rustc dep-info OUT_DIR is not absolute",
+        ));
+    }
+    let current = current_out_dir.to_string_lossy();
+    if old_out_dir == current {
+        return Ok(());
+    }
+    let old_generated = Path::new(old_out_dir).join(generated_name);
+    let new_generated = current_out_dir.join(generated_name);
+    let old_generated = old_generated.to_string_lossy();
+    let new_generated = new_generated.to_string_lossy();
+    let mut rewritten = Vec::with_capacity(bytes.len() + current.len());
+    let mut saw_generated_path = false;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(PREFIX) {
+            rewritten.extend_from_slice(PREFIX);
+            rewritten.extend_from_slice(current.as_bytes());
+            if line.ends_with(b"\r\n") {
+                rewritten.extend_from_slice(b"\r\n");
+            } else if line.ends_with(b"\n") {
+                rewritten.push(b'\n');
+            }
+        } else {
+            let rebased_line =
+                replace_make_depfile_path(line, old_generated.as_bytes(), new_generated.as_bytes());
+            saw_generated_path |= rebased_line != line;
+            rewritten.extend_from_slice(&rebased_line);
+        }
+    }
+    // The certificate attests that this generated include is the only
+    // OUT_DIR-dependent input. The new physical path may itself contain the
+    // old directory's text, so a raw substring search is not a valid check.
+    if !saw_generated_path || rewritten == bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rustc dep-info OUT_DIR rebase was incomplete",
+        ));
+    }
+    atomic_replace_bytes(path, &rewritten)
+}
+
 fn atomic_replace_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -318,6 +393,165 @@ fn replace_all(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perf_out_dir_depinfo_hit_rebases_generated_path_and_env() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let depfile = temp.path().join("libsqlite3_sys.d");
+        let a = temp
+            .path()
+            .join("checkout-a/target/build/libsqlite3-sys/out");
+        let b = temp
+            .path()
+            .join("checkout-b/target/build/libsqlite3-sys/out");
+        let a_text = a.to_string_lossy();
+        let b_text = b.to_string_lossy();
+        let old_generated =
+            quote_make_depfile_path(a.join("bindgen.rs").to_string_lossy().as_bytes());
+        let new_generated =
+            quote_make_depfile_path(b.join("bindgen.rs").to_string_lossy().as_bytes());
+        let original = format!(
+            "libsqlite3_sys.d: {}\n{}:\n# env-dep:OUT_DIR={}\n",
+            String::from_utf8_lossy(&old_generated),
+            String::from_utf8_lossy(&old_generated),
+            a_text
+        );
+        std::fs::write(&depfile, original).expect("dep-info fixture");
+        rehydrate_rustc_out_dir_depfile(&depfile, &b, "bindgen.rs").expect("rebase dep-info");
+        let text = std::fs::read_to_string(&depfile).expect("rebased dep-info");
+        assert!(text.contains(&String::from_utf8_lossy(&new_generated).into_owned()));
+        assert!(text.contains(&format!("# env-dep:OUT_DIR={b_text}")));
+        assert!(
+            !text.contains(a_text.as_ref()),
+            "no A path may leak into B dep-info"
+        );
+    }
+
+    #[test]
+    fn out_dir_depinfo_rebase_allows_new_path_containing_old_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let depfile = temp.path().join("libsqlite3_sys.d");
+        let a = temp.path().join("checkout/target/build/libsqlite3-sys/out");
+        let b = a.join("child");
+        let a_text = a.to_string_lossy();
+        let b_text = b.to_string_lossy();
+        let old_generated =
+            quote_make_depfile_path(a.join("bindgen.rs").to_string_lossy().as_bytes());
+        let new_generated =
+            quote_make_depfile_path(b.join("bindgen.rs").to_string_lossy().as_bytes());
+        std::fs::write(
+            &depfile,
+            format!(
+                "libsqlite3_sys.d: {}\n# env-dep:OUT_DIR={a_text}\n",
+                String::from_utf8_lossy(&old_generated)
+            ),
+        )
+        .expect("dep-info fixture");
+        rehydrate_rustc_out_dir_depfile(&depfile, &b, "bindgen.rs")
+            .expect("overlapping path should still rebase");
+        let text = std::fs::read_to_string(&depfile).expect("rebased dep-info");
+        assert_eq!(
+            text,
+            format!(
+                "libsqlite3_sys.d: {}\n# env-dep:OUT_DIR={b_text}\n",
+                String::from_utf8_lossy(&new_generated)
+            )
+        );
+    }
+
+    #[test]
+    fn out_dir_depinfo_rebase_fails_closed_without_generated_dependency() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let depfile = temp.path().join("libsqlite3_sys.d");
+        let a = temp.path().join("checkout-a/out");
+        let b = temp.path().join("checkout-b/out");
+        let original = format!(
+            "libsqlite3_sys.d: src/lib.rs\n# env-dep:OUT_DIR={}\n",
+            a.display()
+        );
+        std::fs::write(&depfile, &original).expect("dep-info fixture");
+        assert!(rehydrate_rustc_out_dir_depfile(&depfile, &b, "bindgen.rs").is_err());
+        assert_eq!(
+            std::fs::read(&depfile).expect("original dep-info"),
+            original.as_bytes()
+        );
+    }
+
+    #[test]
+    fn serde_private_depinfo_hit_rebases_generated_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let depfile = temp.path().join("serde.d");
+        let a = temp.path().join("checkout-a/target/build/serde/out");
+        let b = temp.path().join("checkout-b/target/build/serde/out");
+        let a_text = a.to_string_lossy();
+        let b_text = b.to_string_lossy();
+        let old_generated =
+            quote_make_depfile_path(a.join("private.rs").to_string_lossy().as_bytes());
+        let new_generated =
+            quote_make_depfile_path(b.join("private.rs").to_string_lossy().as_bytes());
+        std::fs::write(
+            &depfile,
+            format!(
+                "serde.d: {}\n# env-dep:OUT_DIR={a_text}\n",
+                String::from_utf8_lossy(&old_generated)
+            ),
+        )
+        .expect("dep-info fixture");
+        rehydrate_rustc_out_dir_depfile(&depfile, &b, "private.rs").expect("rebase dep-info");
+        let text = std::fs::read_to_string(&depfile).expect("rebased dep-info");
+        assert!(text.contains(&String::from_utf8_lossy(&new_generated).into_owned()));
+        assert!(text.contains(&format!("# env-dep:OUT_DIR={b_text}")));
+        assert!(!text.contains(a_text.as_ref()));
+    }
+
+    #[test]
+    fn out_dir_depinfo_rebase_preserves_native_make_escaping() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let depfile = temp.path().join("libsqlite3_sys.d");
+        let a = temp.path().join("checkout a/target/out");
+        let b = temp.path().join("checkout #b/target/out");
+        let old_generated = a.join("bindgen.rs");
+        let old_quoted = quote_make_depfile_path(old_generated.to_string_lossy().as_bytes());
+        let mut original = b"b.d: ".to_vec();
+        original.extend_from_slice(&old_quoted);
+        original.extend_from_slice(b"\r\n# env-dep:OUT_DIR=");
+        original.extend_from_slice(a.to_string_lossy().as_bytes());
+        original.extend_from_slice(b"\r\n");
+        std::fs::write(&depfile, original).expect("dep-info fixture");
+        rehydrate_rustc_out_dir_depfile(&depfile, &b, "bindgen.rs").expect("rebase dep-info");
+        let bytes = std::fs::read(&depfile).expect("rebased dep-info");
+        let new_generated = b.join("bindgen.rs");
+        let new_quoted = quote_make_depfile_path(new_generated.to_string_lossy().as_bytes());
+        assert!(bytes
+            .windows(new_quoted.len())
+            .any(|window| window == new_quoted));
+        let b_text = b.to_string_lossy();
+        assert!(bytes
+            .windows(b_text.len())
+            .any(|window| window == b_text.as_bytes()));
+        let a_text = a.to_string_lossy();
+        assert!(!bytes
+            .windows(a_text.len())
+            .any(|window| window == a_text.as_bytes()));
+    }
+
+    #[test]
+    fn out_dir_depinfo_rebase_fails_closed_without_env_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let depfile = temp.path().join("libsqlite3_sys.d");
+        let original = b"b.d: /checkout-a/out/bindgen.rs\n";
+        std::fs::write(&depfile, original).expect("dep-info fixture");
+        assert!(rehydrate_rustc_out_dir_depfile(
+            &depfile,
+            Path::new("/checkout-b/out"),
+            "bindgen.rs"
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&depfile).expect("unchanged dep-info"),
+            original
+        );
+    }
 
     #[test]
     fn output_references_round_trip_without_utf8_conversion() {
