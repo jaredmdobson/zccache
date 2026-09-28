@@ -177,6 +177,9 @@ pub(in crate::daemon::server) fn canonicalize_logical_depfile(
         );
     }
     if rewritten != bytes {
+        // This staging path is not a committed cache entry. The publisher
+        // syncs the copied output and generation before committing its
+        // durable pointer, so syncing this transient source is redundant.
         atomic_replace_bytes(path, &rewritten)?;
     }
     Ok(())
@@ -189,6 +192,9 @@ pub(in crate::daemon::server) fn rehydrate_logical_depfile(
     let bytes = std::fs::read(path)?;
     let rewritten = rehydrate_logical_depfile_bytes(&bytes, requested_outputs);
     if rewritten != bytes {
+        // This is a compiler-visible output, not the durable published copy.
+        // The compiler would not fsync its depfile either; only the rename is
+        // needed to keep readers from observing a partial rewrite.
         atomic_replace_bytes(path, &rewritten)?;
     }
     Ok(())
@@ -266,6 +272,8 @@ pub(in crate::daemon::server) fn rehydrate_rustc_out_dir_depfile(
             "rustc dep-info OUT_DIR rebase was incomplete",
         ));
     }
+    // Compiler-visible dep-info for the current build, not durable cache
+    // state: only the rename is needed (see `rehydrate_logical_depfile`).
     atomic_replace_bytes(path, &rewritten)
 }
 
@@ -298,7 +306,6 @@ fn atomic_replace_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .write(true)
             .open(&temporary)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
         drop(file);
         // The destination depfile is often the COW-lite hardlink materialized
         // for the current build's output (persist/hardlink.rs marks
@@ -323,9 +330,6 @@ fn atomic_replace_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
             let _ = break_output_hardlink_before_compile(path);
         }
         replace_path(&temporary, path)?;
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
         Ok(())
     })();
     if result.is_err() {
@@ -400,6 +404,10 @@ fn replace_all(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     rewritten.extend_from_slice(&bytes[cursor..]);
     rewritten
 }
+
+#[cfg(test)]
+#[path = "staged_paths_perf_tests.rs"]
+mod perf_tests;
 
 #[cfg(test)]
 mod tests {
