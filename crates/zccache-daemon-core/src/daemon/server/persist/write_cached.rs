@@ -161,6 +161,7 @@ pub(in crate::daemon::server) fn materialize_cached_file_with_mode(
         delivery,
         mode,
         force_observation,
+        SiblingFloorPass::PerFile,
     )
 }
 
@@ -170,6 +171,7 @@ pub(in crate::daemon::server) fn materialize_verified_cached_file_observed(
     delivery: crate::compiler::DeliveryPolicy,
     mode: MaterializationMode,
     force_observation: bool,
+    pass: SiblingFloorPass,
 ) -> std::io::Result<StagedMaterializationStats> {
     // A legacy cache-file hit can restore a Cargo build-script executable. Hold
     // the same exclusion as staged delivery through every materialization tier:
@@ -184,6 +186,7 @@ pub(in crate::daemon::server) fn materialize_verified_cached_file_observed(
             delivery,
             mode,
             force_observation,
+            pass,
         )
     };
     if result.is_ok() {
@@ -198,6 +201,7 @@ fn materialize_verified_cached_file_tiers(
     delivery: crate::compiler::DeliveryPolicy,
     mode: MaterializationMode,
     force_observation: bool,
+    pass: SiblingFloorPass,
 ) -> std::io::Result<StagedMaterializationStats> {
     let staged = is_staged_artifact_path(cache_file);
     let observe = force_observation || staged;
@@ -225,28 +229,30 @@ fn materialize_verified_cached_file_tiers(
     if crate::platform::fs::identity::same_file(out_path, cache_file).unwrap_or(false) {
         if !hardlink_allowed {
             let bytes = std::fs::metadata(cache_file)?.len();
-            let floor = kernal_api::platform::fs::FileTime::from_last_modification_time(
-                &std::fs::metadata(cache_file)?,
-            );
-            detach_with_floored_mtime(out_path, cache_file, floor, mode)?;
-            // The detached output is a new inode: apply the sibling floor
-            // exactly like the copy tier, or a mode switch (LINK -> COPY)
-            // could leave it older than its siblings (#466/#467).
-            touch_mtime(out_path);
+            // The detached output is a new inode carrying the same mtime the
+            // copy tier gives it, sibling floor included, so a mode switch
+            // (LINK -> COPY) cannot leave it older than its siblings
+            // (#466/#467).
+            let hit = resolve_hit_mtime(out_path, cache_file, pass)?;
+            detach_with_floored_mtime(out_path, cache_file, hit.mtime, mode)?;
             return Ok(observed(0, 0, 1, bytes));
         }
         crate::platform::fs::permissions::set_cache_blob_sealed(cache_file, readonly_enabled())?;
-        match compute_sibling_floor(out_path)? {
-            Some(floor) => {
-                let bytes = std::fs::metadata(cache_file)?.len();
-                detach_with_floored_mtime(out_path, cache_file, floor, mode)?;
-                return Ok(observed(0, 0, 1, bytes));
-            }
-            None => register_hardlink(cache_file, out_path)?,
+        let hit = resolve_hit_mtime(out_path, cache_file, pass)?;
+        if hit.raised {
+            let bytes = std::fs::metadata(cache_file)?.len();
+            detach_with_floored_mtime(out_path, cache_file, hit.mtime, mode)?;
+            return Ok(observed(0, 0, 1, bytes));
         }
+        register_hardlink(cache_file, out_path)?;
         return Ok(observed(0, 1, 0, 0));
     }
     remove_materialized_output(out_path)?;
+    // One mtime for this hit in every tier (#1771): the cache object's, raised
+    // by the sibling floor. A raised hit cannot share the cache inode, so the
+    // hardlink tier below is skipped for it, exactly as the same-inode branch
+    // above detaches instead of rewriting the shared blob.
+    let hit = resolve_hit_mtime(out_path, cache_file, pass)?;
     let caps = delivery_caps(mode, cache_file, out_path);
     // The reflink decision never depends on the link count, so a successful
     // clone costs no link-count stat.
@@ -266,8 +272,7 @@ fn materialize_verified_cached_file_tiers(
         && kernal_api::platform::fs::reflink_file(cache_file, out_path).is_ok()
     {
         crate::platform::fs::permissions::make_writable(out_path)?;
-        restore_cache_mtime(cache_file, out_path)?;
-        touch_mtime(out_path);
+        stamp_mtime(out_path, hit.mtime)?;
         return Ok(observed(1, 0, 0, 0));
     }
     if mode == MaterializationMode::Reflink {
@@ -280,12 +285,13 @@ fn materialize_verified_cached_file_tiers(
     // call sites in this module; a genuinely-too-many-links file still
     // fails the real `std::fs::hard_link` call below, which already has
     // a graceful copy fallback.
-    let link_count = if hardlink_allowed && caps.hardlink {
+    let link_count = if hardlink_allowed && !hit.raised && caps.hardlink {
         crate::platform::fs::links::hard_link_count(cache_file).unwrap_or_default()
     } else {
         0
     };
-    let hardlink_candidate = plan_tiers(mode, hardlink_eligible, caps, link_count).hardlink;
+    let hardlink_candidate =
+        plan_tiers(mode, hardlink_eligible, caps, link_count).hardlink && !hit.raised;
     #[cfg(test)]
     let hardlink_candidate = hardlink_candidate
         && inject_staged_fault(out_path, StagedFaultPoint::MaterializeHardlink).is_ok();
@@ -327,10 +333,7 @@ fn materialize_verified_cached_file_tiers(
                         let _ = cleanup_failed_hardlink(registration, cache_file, out_path);
                     } else {
                         match commit_hardlink_registration(registration, out_path) {
-                            Ok(()) => {
-                                touch_mtime(out_path);
-                                return Ok(observed(0, 1, 0, 0));
-                            }
+                            Ok(()) => return Ok(observed(0, 1, 0, 0)),
                             Err(error) => {
                                 // A failure here (including a transient stat/handle
                                 // error resolving the just-created link's identity)
@@ -368,8 +371,7 @@ fn materialize_verified_cached_file_tiers(
     inject_staged_fault(out_path, StagedFaultPoint::MaterializeCopy)?;
     let copied_bytes = mode.copy_file(cache_file, out_path)?;
     crate::platform::fs::permissions::make_writable(out_path)?;
-    restore_cache_mtime(cache_file, out_path)?;
-    touch_mtime(out_path);
+    stamp_mtime(out_path, hit.mtime)?;
     Ok(observed(0, 0, 1, copied_bytes))
 }
 
@@ -443,13 +445,6 @@ fn detach_with_floored_mtime(
     result
 }
 
-fn restore_cache_mtime(cache_file: &Path, out_path: &Path) -> std::io::Result<()> {
-    let mtime = kernal_api::platform::fs::FileTime::from_last_modification_time(
-        &std::fs::metadata(cache_file)?,
-    );
-    kernal_api::platform::fs::set_file_mtime(out_path, mtime)
-}
-
 fn remove_materialized_output(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -483,6 +478,18 @@ pub(in crate::daemon::server) fn write_cached_payload_with_policy_stats(
     delivery: crate::compiler::DeliveryPolicy,
     mode: MaterializationMode,
 ) -> MaterializationResult<StagedMaterializationStats> {
+    write_cached_payload_with_floor(out_path, payload, delivery, mode, SiblingFloorPass::PerFile)
+}
+
+/// [`write_cached_payload_with_policy_stats`] told whether a batch floor
+/// follows delivery (see [`SiblingFloorPass`]).
+fn write_cached_payload_with_floor(
+    out_path: &Path,
+    payload: &CachedPayload,
+    delivery: crate::compiler::DeliveryPolicy,
+    mode: MaterializationMode,
+    pass: SiblingFloorPass,
+) -> MaterializationResult<StagedMaterializationStats> {
     match payload {
         CachedPayload::Bytes(data) => {
             // Inline payloads can also be executable outputs. Keep their direct
@@ -496,7 +503,7 @@ pub(in crate::daemon::server) fn write_cached_payload_with_policy_stats(
         }
         CachedPayload::File(path) => {
             verify_registered_blob(path).map_err(|error| classify_cache_read_error(path, error))?;
-            materialize_verified_cached_file_observed(out_path, path, delivery, mode, false)
+            materialize_verified_cached_file_observed(out_path, path, delivery, mode, false, pass)
                 .map_err(|error| classify_file_materialization_error(out_path, path, error))
         }
     }
@@ -611,6 +618,37 @@ where
         policies,
         mode,
         false,
+        std::time::SystemTime::now(),
+    )
+}
+
+/// [`write_payloads_par_with_mtime_floor_and_policies_observed`] with the
+/// batch floor's `now()` seed pinned, so the mode-invariance contract can be
+/// asserted on exact mtimes (#1771).
+#[cfg(test)]
+pub(in crate::daemon::server) fn write_payloads_par_with_mtime_floor_and_policies_observed_at<
+    P,
+    R,
+>(
+    targets: &[P],
+    payloads: &[CachedPayload],
+    floor_paths: &[R],
+    policies: &[crate::compiler::DeliveryPolicy],
+    mode: MaterializationMode,
+    seed: std::time::SystemTime,
+) -> MaterializationResult<StagedMaterializationStats>
+where
+    P: AsRef<Path> + Sync,
+    R: AsRef<Path>,
+{
+    write_payloads_par_with_mtime_floor_and_policies_observed_impl(
+        targets,
+        payloads,
+        floor_paths,
+        policies,
+        mode,
+        false,
+        seed,
     )
 }
 
@@ -636,6 +674,7 @@ where
         policies,
         mode,
         true,
+        std::time::SystemTime::now(),
     )
 }
 
@@ -646,6 +685,7 @@ fn write_payloads_par_with_mtime_floor_and_policies_observed_impl<P, R>(
     policies: &[crate::compiler::DeliveryPolicy],
     mode: MaterializationMode,
     provisional_staged: bool,
+    batch_seed: std::time::SystemTime,
 ) -> MaterializationResult<StagedMaterializationStats>
 where
     P: AsRef<Path> + Sync,
@@ -685,12 +725,22 @@ where
                     )
                     .map_err(|error| classify_file_materialization_error(out, path, error))
                 }
-                CachedPayload::Bytes(_) => {
-                    write_cached_payload_with_policy_stats(out, payload, policy, mode)
-                }
+                CachedPayload::Bytes(_) => write_cached_payload_with_floor(
+                    out,
+                    payload,
+                    policy,
+                    mode,
+                    SiblingFloorPass::BatchFollows,
+                ),
             }
         } else {
-            write_cached_payload_with_policy_stats(out, payload, policy, mode)
+            write_cached_payload_with_floor(
+                out,
+                payload,
+                policy,
+                mode,
+                SiblingFloorPass::BatchFollows,
+            )
         }
     };
     let observed = if targets.len() < PAR_WRITE_THRESHOLD {
@@ -740,11 +790,15 @@ where
     // sub-second one. If you do change it, CLAUDE.md's guidance is to gate the
     // now() seed on the *consumer* (make/ninja need fresh outputs; cargo may
     // not) rather than re-globalizing either behaviour.
-    let batch_floor = std::time::SystemTime::now();
-    floor_materialized_outputs_to_input_max(
+    //
+    // The seed is `batch_seed` (`now()` in production). Recorded inputs
+    // exist only for rustc requests, which selects `RustcInputFloor`; every
+    // other consumer is `NativeFreshHit` (see `persist/mtime.rs`).
+    apply_batch_policy(
+        BatchPolicy::for_inputs(!floor_paths.is_empty()),
         targets.iter().map(|out| out.as_ref()),
         floor_paths.iter().map(|path| path.as_ref()),
-        batch_floor,
+        batch_seed,
     );
     Ok(observed)
 }
