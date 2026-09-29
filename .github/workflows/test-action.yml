@@ -37,6 +37,7 @@ jobs:
   target-snapshot-gc:
     name: "Target snapshot GC unit tests"
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 
@@ -48,6 +49,7 @@ jobs:
     name: "${{ matrix.name }}"
     needs: cache-pre-prune
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -234,6 +236,7 @@ jobs:
     name: "No-save mode (Linux)"
     needs: cache-pre-prune
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 
@@ -276,6 +279,7 @@ jobs:
     name: "cargo-registry (${{ matrix.os }})"
     needs: cache-pre-prune
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -386,6 +390,7 @@ jobs:
     name: "gha-cache (Linux)"
     needs: cache-pre-prune
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - name: Wait for current-main cache pre-prune
