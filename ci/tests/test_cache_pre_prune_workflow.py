@@ -111,7 +111,7 @@ def test_cook_prune_fails_closed_when_a_platform_hash_is_missing() -> None:
     assert plan["keep"] == [1]
 
 
-def test_transition_pre_prune_uses_live_usage_and_fails_before_any_delete_on_overrun() -> None:
+def test_transition_pre_prune_retires_dead_generations_first_then_forecasts_and_fails_closed() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/cache-pre-prune.yml").read_text(encoding="utf-8")
     )
@@ -122,8 +122,16 @@ def test_transition_pre_prune_uses_live_usage_and_fails_before_any_delete_on_ove
     )
     assert "before.usageBytes" in script and "before.listedBytes" in script
     assert "planLockTransitionPrePrune" in script
-    assert "if (!plan.ok)" in script
-    assert script.index("if (!plan.ok)") < script.index("deleteActionsCacheById")
+    # #1850: superseded generations are deleted BEFORE the forecast verdict,
+    # the inventory is re-converged, and the post-delete peak is re-forecast.
+    retire = script.index("plan.retireFirstIds")
+    reconverge = script.index("convergeInventory(dead.map((cache) => cache.id))")
+    verdict = script.index("if (!plan.ok)")
+    assert retire < script.index("deleteCache(cache, \"superseded") < reconverge < verdict
+    assert reconverge < script.index("plan = planFor(before)", reconverge) < verdict
+    # The forecast-dependent transition deletes stay behind the fail-closed verdict.
+    assert verdict < script.index("deleteCache(cache, \"forecasted old-lock cache\")")
+    assert script.count("deleteActionsCacheById") == 1  # one guarded helper
     assert "convergeInventory(stale.map((cache) => cache.id))" in script
     # The planner's fixed profile allowlist, rather than row count, bounds
     # selection: one profile may have several stale lock generations.
